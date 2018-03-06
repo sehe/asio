@@ -21,16 +21,33 @@ class client
 public:
   client(boost::asio::io_context& io_context,
       boost::asio::ssl::context& context,
-      boost::asio::ip::tcp::resolver::results_type endpoints)
-    : socket_(io_context, context)
+      boost::asio::ip::tcp::resolver::query query)
+    : socket_(io_context, context), query_(query), timer_(io_context)
   {
     socket_.set_verify_mode(boost::asio::ssl::verify_peer);
     socket_.set_verify_callback(
         boost::bind(&client::verify_certificate, this, _1, _2));
 
-    boost::asio::async_connect(socket_.lowest_layer(), endpoints,
+    start_connect();
+  }
+
+  void start_connect() {
+    boost::asio::ip::tcp::resolver r(socket_.get_io_context());
+
+    boost::asio::async_connect(socket_.lowest_layer(), r.resolve(query_),
         boost::bind(&client::handle_connect, this,
           boost::asio::placeholders::error));
+  }
+
+  void do_reconnect() {
+    timer_.expires_from_now(boost::posix_time::millisec(500));
+    timer_.async_wait(boost::bind(&client::handle_reconnect_timer, this, boost::asio::placeholders::error));
+  }
+
+  void handle_reconnect_timer(boost::system::error_code ec) {
+    if (!ec) {
+      start_connect();
+    }
   }
 
   bool verify_certificate(bool preverified,
@@ -63,13 +80,11 @@ public:
     else
     {
       std::cout << "Connect failed: " << error.message() << "\n";
+      do_reconnect();
     }
   }
 
-  void handle_handshake(const boost::system::error_code& error)
-  {
-    if (!error)
-    {
+  void accept_message() {
       std::cout << "Enter message: ";
       std::cin.getline(request_, max_length);
       size_t request_length = strlen(request_);
@@ -80,9 +95,17 @@ public:
             boost::asio::placeholders::error,
             boost::asio::placeholders::bytes_transferred));
     }
+
+  void handle_handshake(const boost::system::error_code& error)
+  {
+    if (!error)
+    {
+      accept_message();
+    }
     else
     {
       std::cout << "Handshake failed: " << error.message() << "\n";
+      do_reconnect();
     }
   }
 
@@ -100,6 +123,7 @@ public:
     else
     {
       std::cout << "Write failed: " << error.message() << "\n";
+      do_reconnect();
     }
   }
 
@@ -111,15 +135,20 @@ public:
       std::cout << "Reply: ";
       std::cout.write(reply_, bytes_transferred);
       std::cout << "\n";
+
+      accept_message(); // continue using the same socket_ until fail
     }
     else
     {
       std::cout << "Read failed: " << error.message() << "\n";
+      do_reconnect();
     }
   }
 
 private:
   boost::asio::ssl::stream<boost::asio::ip::tcp::socket> socket_;
+  boost::asio::ip::tcp::resolver::query query_;
+  boost::asio::deadline_timer timer_;
   char request_[max_length];
   char reply_[max_length];
 };
@@ -135,15 +164,10 @@ int main(int argc, char* argv[])
     }
 
     boost::asio::io_context io_context;
-
-    boost::asio::ip::tcp::resolver resolver(io_context);
-    boost::asio::ip::tcp::resolver::results_type endpoints =
-      resolver.resolve(argv[1], argv[2]);
-
     boost::asio::ssl::context ctx(boost::asio::ssl::context::sslv23);
     ctx.load_verify_file("ca.pem");
 
-    client c(io_context, ctx, endpoints);
+        client c(io_context, ctx, {argv[1], argv[2]});
 
     io_context.run();
   }
