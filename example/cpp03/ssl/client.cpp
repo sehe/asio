@@ -10,36 +10,48 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <boost/optional.hpp>
 #include <boost/bind.hpp>
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 
 enum { max_length = 1024 };
 
+namespace ssl = boost::asio::ssl;
+using tcp = boost::asio::ip::tcp;
+
 class client
 {
+    using stream = ssl::stream<tcp::socket>;
 public:
-  client(boost::asio::io_context& io_context,
-      boost::asio::ssl::context& context,
-      boost::asio::ip::tcp::resolver::query query)
-    : socket_(io_context, context), query_(query), timer_(io_context)
+  client(boost::asio::io_context& io_context, ssl::context& context, tcp::resolver::query query)
+    : context_(context), socket_(boost::in_place_init, io_context, context_), query_(query), timer_(io_context)
   {
-    socket_.set_verify_mode(boost::asio::ssl::verify_peer);
-    socket_.set_verify_callback(
+    socket_->set_verify_mode(ssl::verify_peer);
+    socket_->set_verify_callback(
         boost::bind(&client::verify_certificate, this, _1, _2));
 
     start_connect();
   }
 
   void start_connect() {
-    boost::asio::ip::tcp::resolver r(socket_.get_io_context());
+    tcp::resolver r(socket_->get_io_context());
 
-    boost::asio::async_connect(socket_.lowest_layer(), r.resolve(query_),
+    boost::asio::async_connect(socket_->lowest_layer(), r.resolve(query_),
         boost::bind(&client::handle_connect, this,
           boost::asio::placeholders::error));
   }
 
   void do_reconnect() {
+    auto& io_context = socket_->get_io_context();
+    {
+        boost::system::error_code ec;
+        socket_->shutdown(ec);
+        if (ec) std::cout << "shutdown error: " << ec.message() << std::endl;
+    }
+
+    socket_.emplace(io_context, context_);
+
     timer_.expires_from_now(boost::posix_time::millisec(500));
     timer_.async_wait(boost::bind(&client::handle_reconnect_timer, this, boost::asio::placeholders::error));
   }
@@ -51,7 +63,7 @@ public:
   }
 
   bool verify_certificate(bool preverified,
-      boost::asio::ssl::verify_context& ctx)
+      ssl::verify_context& ctx)
   {
     // The verify callback can be used to check whether the certificate that is
     // being presented is valid for the peer. For example, RFC 2818 describes
@@ -73,7 +85,7 @@ public:
   {
     if (!error)
     {
-      socket_.async_handshake(boost::asio::ssl::stream_base::client,
+      socket_->async_handshake(ssl::stream_base::client,
           boost::bind(&client::handle_handshake, this,
             boost::asio::placeholders::error));
     }
@@ -85,16 +97,16 @@ public:
   }
 
   void accept_message() {
-      std::cout << "Enter message: ";
-      std::cin.getline(request_, max_length);
-      size_t request_length = strlen(request_);
+    std::cout << "Enter message: ";
+    std::cin.getline(request_, max_length);
+    size_t request_length = strlen(request_);
 
-      boost::asio::async_write(socket_,
-          boost::asio::buffer(request_, request_length),
-          boost::bind(&client::handle_write, this,
-            boost::asio::placeholders::error,
-            boost::asio::placeholders::bytes_transferred));
-    }
+    boost::asio::async_write(*socket_,
+        boost::asio::buffer(request_, request_length),
+        boost::bind(&client::handle_write, this,
+          boost::asio::placeholders::error,
+          boost::asio::placeholders::bytes_transferred));
+  }
 
   void handle_handshake(const boost::system::error_code& error)
   {
@@ -114,7 +126,7 @@ public:
   {
     if (!error)
     {
-      boost::asio::async_read(socket_,
+      boost::asio::async_read(*socket_,
           boost::asio::buffer(reply_, bytes_transferred),
           boost::bind(&client::handle_read, this,
             boost::asio::placeholders::error,
@@ -146,8 +158,10 @@ public:
   }
 
 private:
-  boost::asio::ssl::stream<boost::asio::ip::tcp::socket> socket_;
-  boost::asio::ip::tcp::resolver::query query_;
+  ssl::context& context_;
+
+  boost::optional<stream> socket_;
+  tcp::resolver::query query_;
   boost::asio::deadline_timer timer_;
   char request_[max_length];
   char reply_[max_length];
@@ -155,26 +169,26 @@ private:
 
 int main(int argc, char* argv[])
 {
-  try
-  {
-    if (argc != 3)
+    try
     {
-      std::cerr << "Usage: client <host> <port>\n";
-      return 1;
-    }
+        if (argc != 3)
+        {
+            std::cerr << "Usage: client <host> <port>\n";
+            return 1;
+        }
 
-    boost::asio::io_context io_context;
-    boost::asio::ssl::context ctx(boost::asio::ssl::context::sslv23);
-    ctx.load_verify_file("ca.pem");
+        boost::asio::io_context io_context;
+        ssl::context ctx(ssl::context::sslv23);
+        ctx.load_verify_file("ca.pem");
 
         client c(io_context, ctx, {argv[1], argv[2]});
 
-    io_context.run();
-  }
-  catch (std::exception& e)
-  {
-    std::cerr << "Exception: " << e.what() << "\n";
-  }
+        io_context.run();
+    }
+    catch (std::exception& e)
+    {
+        std::cerr << "Exception: " << e.what() << "\n";
+    }
 
-  return 0;
+    return 0;
 }
